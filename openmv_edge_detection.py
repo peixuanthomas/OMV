@@ -11,10 +11,9 @@ import image
 import time
 
 
-# QVGA has one quarter of the pixels of the CanMV VGA example and is a good
-# balance between visible edge detail and frame rate. Use csi.QQVGA (160x120)
-# if the application values frame rate over fine edge detail.
-FRAME_SIZE = csi.QVGA
+# Match the VGA resolution used by the original 04.Detecting example. The H7
+# Plus has enough external memory for grayscale VGA with double buffering.
+FRAME_SIZE = csi.VGA
 FRAME_BUFFER_COUNT = 2
 CAMERA_WARMUP_MS = 1500
 

@@ -1,6 +1,6 @@
-"""OpenMV boot entry point for real-time edge detection."""
+"""OpenMV boot entry point for polygon boundary detection."""
 
-from openmv_edge_detection import main
+from polygon_detection import main
 
 
 main()

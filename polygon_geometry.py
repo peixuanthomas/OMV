@@ -1,13 +1,17 @@
-"""Pure-Python polygon geometry helpers for CanMV K230.
+"""Pure-Python polygon geometry helpers for OpenMV.
 
 The module deliberately avoids CPython-only modules so the same code can run
-under CanMV MicroPython and in host-side tests.
+under OpenMV MicroPython and in host-side tests.
 """
 
 import math
 
 
 _EPSILON = 1e-9
+# The physical pieces do not contain almost-straight "corners". A fitted
+# vertex at or above this interior angle is threshold stair-stepping and the
+# two adjacent segments should be treated as one edge.
+COLLINEAR_MERGE_ANGLE_DEG = 170.0
 
 
 def distance(point_a, point_b):
@@ -64,6 +68,27 @@ def _point_line_distance(point, line_start, line_end):
         - (line_end[1] * line_start[0])
     )
     return numerator / denominator
+
+
+def _interior_angle_degrees(previous, vertex, following):
+    first_x = previous[0] - vertex[0]
+    first_y = previous[1] - vertex[1]
+    second_x = following[0] - vertex[0]
+    second_y = following[1] - vertex[1]
+    first_length = math.sqrt(
+        (first_x * first_x) + (first_y * first_y)
+    )
+    second_length = math.sqrt(
+        (second_x * second_x) + (second_y * second_y)
+    )
+    denominator = first_length * second_length
+    if denominator < _EPSILON:
+        return 0.0
+    cosine = (
+        (first_x * second_x) + (first_y * second_y)
+    ) / denominator
+    cosine = max(-1.0, min(1.0, cosine))
+    return math.acos(cosine) * (180.0 / math.pi)
 
 
 def _deduplicate_contour(points, minimum_spacing=0.5):
@@ -182,6 +207,27 @@ def _fit_line(points):
     return normal_a, normal_b, normal_c
 
 
+def _fit_line_robust(points, maximum_residual=2.5):
+    """Fit a line twice, discarding small contour bumps on the second pass."""
+    line = _fit_line(points)
+    if line is None or len(points) < 6:
+        return line
+
+    normal_a, normal_b, normal_c = line
+    inliers = [
+        point
+        for point in points
+        if abs(
+            (normal_a * point[0])
+            + (normal_b * point[1])
+            + normal_c
+        ) <= maximum_residual
+    ]
+    if len(inliers) < 4 or len(inliers) * 2 < len(points):
+        return line
+    return _fit_line(inliers)
+
+
 def _intersect_lines(line_a, line_b):
     a1, b1, c1 = line_a
     a2, b2, c2 = line_b
@@ -206,7 +252,13 @@ def refine_polygon(contour, vertex_indices, maximum_shift=12.0):
             vertex_indices[index],
             vertex_indices[(index + 1) % len(vertex_indices)],
         )
-        lines.append(_fit_line(samples))
+        # RDP vertices sit on pixel stair-steps at each corner. Excluding a
+        # small endpoint slice keeps those turns from rotating the fitted
+        # straight side, while retaining enough pixels for short valid edges.
+        trim = min(4, len(samples) // 12)
+        if trim > 0 and (len(samples) - (trim * 2)) >= 4:
+            samples = samples[trim:-trim]
+        lines.append(_fit_line_robust(samples))
 
     refined = []
     for index in range(len(vertex_indices)):
@@ -230,6 +282,11 @@ def refine_polygon(contour, vertex_indices, maximum_shift=12.0):
 def _prune_short_corner_pairs(contour, vertex_indices, minimum_edge_length):
     """Remove RDP corner duplicates caused by one-pixel boundary stair-steps."""
     indices = list(vertex_indices)
+    # Three-to-five vertices are all legal output shapes.  Never turn one
+    # legal shape into another merely because the *rough* RDP endpoints make
+    # an edge look short: line fitting below can move those endpoints outward
+    # and recover the true edge length.  Pruning is only safe when RDP has
+    # produced more vertices than the detector can report.
     while len(indices) > 5:
         shortest_position = -1
         shortest_length = None
@@ -269,8 +326,216 @@ def _prune_short_corner_pairs(contour, vertex_indices, minimum_edge_length):
     return indices
 
 
+def _refine_and_validate(
+    contour,
+    vertex_indices,
+    epsilon,
+    minimum_edge_length,
+    minimum_area,
+    maximum_vertex_shift,
+):
+    """Refine one RDP candidate and return its vertices and error reason."""
+    if len(vertex_indices) < 3 or len(vertex_indices) > 5:
+        rough = [contour[index] for index in vertex_indices]
+        return normalize_vertices(rough), (
+            "too_few_vertices"
+            if len(vertex_indices) < 3
+            else "too_many_vertices"
+        )
+
+    allowed_shift = maximum_vertex_shift
+    if allowed_shift is None:
+        allowed_shift = max(8.0, epsilon * 4.0)
+
+    refined = refine_polygon(contour, vertex_indices, allowed_shift)
+    vertices = normalize_vertices(refined)
+    valid, reason = validate_polygon(
+        vertices,
+        minimum_vertices=3,
+        maximum_vertices=5,
+        minimum_edge_length=minimum_edge_length,
+        minimum_area=minimum_area,
+    )
+    return vertices, reason if not valid else None
+
+
+def _remove_invalid_short_edge_corner(
+    contour,
+    vertex_indices,
+    epsilon,
+    minimum_edge_length,
+    maximum_vertex_shift,
+):
+    """Merge the less significant endpoint of one invalid fitted short edge."""
+    indices = list(vertex_indices)
+    if len(indices) <= 3:
+        return indices
+
+    allowed_shift = maximum_vertex_shift
+    if allowed_shift is None:
+        allowed_shift = max(8.0, epsilon * 4.0)
+    refined = refine_polygon(contour, indices, allowed_shift)
+
+    shortest_position = min(
+        range(len(refined)),
+        key=lambda position: distance(
+            refined[position],
+            refined[(position + 1) % len(refined)],
+        ),
+    )
+    shortest_length = distance(
+        refined[shortest_position],
+        refined[(shortest_position + 1) % len(refined)],
+    )
+    if shortest_length >= minimum_edge_length:
+        return indices
+
+    first_position = shortest_position
+    second_position = (shortest_position + 1) % len(indices)
+    previous_position = (first_position - 1) % len(indices)
+    next_position = (second_position + 1) % len(indices)
+    remove_first_error = _point_line_distance(
+        refined[first_position],
+        refined[previous_position],
+        refined[second_position],
+    )
+    remove_second_error = _point_line_distance(
+        refined[second_position],
+        refined[first_position],
+        refined[next_position],
+    )
+    remove_position = (
+        first_position
+        if remove_first_error <= remove_second_error
+        else second_position
+    )
+    indices.pop(remove_position)
+    return indices
+
+
+def _remove_refined_collinear_corner(
+    contour,
+    vertex_indices,
+    epsilon,
+    minimum_edge_length,
+    maximum_vertex_shift,
+):
+    """Remove one long-edge split that becomes nearly collinear after fitting."""
+    indices = list(vertex_indices)
+    if len(indices) <= 3:
+        return indices
+
+    allowed_shift = maximum_vertex_shift
+    if allowed_shift is None:
+        allowed_shift = max(8.0, epsilon * 4.0)
+    refined = refine_polygon(contour, indices, allowed_shift)
+    minimum_supported_edge = minimum_edge_length
+    best_position = None
+    best_angle = None
+
+    for position in range(len(refined)):
+        previous_position = (position - 1) % len(refined)
+        next_position = (position + 1) % len(refined)
+        previous_length = distance(
+            refined[previous_position], refined[position]
+        )
+        next_length = distance(
+            refined[position], refined[next_position]
+        )
+        # Do not use a sub-minimum fragment as evidence for a corner. If both
+        # incident sides are legal yet the fitted point is nearly collinear,
+        # it is the unstable fifth-point split handled by this fallback.
+        if (
+            previous_length < minimum_supported_edge
+            or next_length < minimum_supported_edge
+        ):
+            continue
+
+        angle = _interior_angle_degrees(
+            refined[previous_position],
+            refined[position],
+            refined[next_position],
+        )
+        if (
+            angle >= COLLINEAR_MERGE_ANGLE_DEG
+            and (best_angle is None or angle > best_angle)
+        ):
+            best_position = position
+            best_angle = angle
+
+    if best_position is not None:
+        indices.pop(best_position)
+    return indices
+
+
+def _remove_collinear_fitted_vertex(
+    vertices,
+    minimum_edge_length,
+):
+    """Drop one nearly-collinear fitted point without refitting its neighbours."""
+    reduced = list(vertices)
+    if len(reduced) <= 3:
+        return reduced
+
+    best_position = None
+    best_angle = None
+    for position in range(len(reduced)):
+        previous_position = (position - 1) % len(reduced)
+        next_position = (position + 1) % len(reduced)
+        if (
+            distance(reduced[previous_position], reduced[position])
+            < minimum_edge_length
+            or distance(reduced[position], reduced[next_position])
+            < minimum_edge_length
+        ):
+            continue
+        angle = _interior_angle_degrees(
+            reduced[previous_position],
+            reduced[position],
+            reduced[next_position],
+        )
+        if (
+            angle >= COLLINEAR_MERGE_ANGLE_DEG
+            and (best_angle is None or angle > best_angle)
+        ):
+            best_position = position
+            best_angle = angle
+
+    if best_position is not None:
+        reduced.pop(best_position)
+    return normalize_vertices(reduced)
+
+
+def _merge_collinear_fitted_vertices(
+    vertices,
+    minimum_edge_length,
+    minimum_area,
+):
+    """Merge every valid near-straight split, including a 4->3 cleanup."""
+    merged = normalize_vertices(vertices)
+    while len(merged) > 3:
+        candidate = _remove_collinear_fitted_vertex(
+            merged,
+            minimum_edge_length,
+        )
+        if len(candidate) == len(merged):
+            break
+
+        valid, _ = validate_polygon(
+            candidate,
+            minimum_vertices=3,
+            maximum_vertices=5,
+            minimum_edge_length=minimum_edge_length,
+            minimum_area=minimum_area,
+        )
+        if not valid:
+            break
+        merged = candidate
+    return merged
+
+
 def normalize_vertices(vertices):
-    """Return clockwise image-coordinate vertices with a stable first point."""
+    """Return clockwise image-coordinate vertices, starting at the top-left."""
     normalized = [(float(point[0]), float(point[1])) for point in vertices]
     if len(normalized) < 3:
         return normalized
@@ -279,12 +544,19 @@ def normalize_vertices(vertices):
     if signed_area(normalized) < 0:
         normalized.reverse()
 
+    # Line intersections are sub-pixel values. On a nearly horizontal top
+    # edge, tiny fit noise must not make V1 alternate between its two ends.
+    top_y = min(point[1] for point in normalized)
+    top_band = [
+        index
+        for index in range(len(normalized))
+        if normalized[index][1] <= (top_y + 1.0)
+    ]
     first_index = min(
-        range(len(normalized)),
+        top_band,
         key=lambda index: (
-            normalized[index][0] + normalized[index][1],
-            normalized[index][1],
             normalized[index][0],
+            normalized[index][1],
         ),
     )
     return normalized[first_index:] + normalized[:first_index]
@@ -366,33 +638,175 @@ def polygon_from_contour(
     maximum_vertex_shift=None,
 ):
     """Approximate, refine, normalize and validate a traced contour."""
-    cleaned, indices = simplify_closed_contour_indices(contour, rdp_epsilon)
-    if len(indices) > 5:
-        indices = _prune_short_corner_pairs(
-            cleaned, indices, minimum_edge_length
-        )
-    if maximum_vertex_shift is None:
-        maximum_vertex_shift = max(8.0, rdp_epsilon * 4.0)
+    cleaned = _deduplicate_contour(contour)
+    indices = []
+    base_epsilon = float(rdp_epsilon)
+    epsilon = base_epsilon
 
-    if len(indices) < 3 or len(indices) > 5:
-        rough = [cleaned[index] for index in indices]
-        return normalize_vertices(rough), (
-            "too_few_vertices" if len(indices) < 3 else "too_many_vertices"
-        )
+    # A one-pixel staircase or small reflection can create extra RDP corners.
+    # The official pieces have at most five real sides, so progressively relax
+    # the approximation until the result fits that physical constraint.
+    for _ in range(5):
+        cleaned, indices = simplify_closed_contour_indices(cleaned, epsilon)
+        if len(indices) <= 5:
+            break
+        epsilon *= 1.35
 
-    refined = refine_polygon(cleaned, indices, maximum_vertex_shift)
-    vertices = normalize_vertices(refined)
-    valid, reason = validate_polygon(
-        vertices,
-        minimum_vertices=3,
-        maximum_vertices=5,
-        minimum_edge_length=minimum_edge_length,
-        minimum_area=minimum_area,
+    indices = _prune_short_corner_pairs(
+        cleaned, indices, minimum_edge_length
     )
-    return vertices, reason if not valid else None
+    vertices, reason = _refine_and_validate(
+        cleaned,
+        indices,
+        epsilon,
+        minimum_edge_length,
+        minimum_area,
+        maximum_vertex_shift,
+    )
+
+    # RDP can split a pointed or pixel-stair-stepped corner into two nearby
+    # vertices. If the fitted result still has an edge below the physical
+    # minimum, the candidate cannot legally keep both endpoints. Merge the
+    # less significant endpoint and retry instead of rejecting the whole
+    # piece. Refinement happens before this fallback, preserving genuine short
+    # sides whose rough RDP endpoints initially underestimated their length.
+    if reason == "edge_too_short" and len(indices) > 3:
+        merged_indices = list(indices)
+        while len(merged_indices) > 3:
+            next_indices = _remove_invalid_short_edge_corner(
+                cleaned,
+                merged_indices,
+                epsilon,
+                minimum_edge_length,
+                maximum_vertex_shift,
+            )
+            if len(next_indices) == len(merged_indices):
+                break
+            merged_indices = next_indices
+            merged_vertices, merged_reason = _refine_and_validate(
+                cleaned,
+                merged_indices,
+                epsilon,
+                minimum_edge_length,
+                minimum_area,
+                maximum_vertex_shift,
+            )
+            if merged_reason is None:
+                indices = merged_indices
+                vertices = merged_vertices
+                reason = None
+                break
+            if merged_reason != "edge_too_short":
+                break
+
+    # Robust line fitting can reveal that a noisy RDP corner merely split one
+    # long physical side. Collapse only well-supported long-edge splits; this
+    # leaves a genuine short side near the physical minimum untouched.
+    if reason is None and len(indices) > 4:
+        collinear_indices = list(indices)
+        while len(collinear_indices) > 4:
+            next_indices = _remove_refined_collinear_corner(
+                cleaned,
+                collinear_indices,
+                epsilon,
+                minimum_edge_length,
+                maximum_vertex_shift,
+            )
+            if len(next_indices) == len(collinear_indices):
+                break
+            candidate_vertices, candidate_reason = _refine_and_validate(
+                cleaned,
+                next_indices,
+                epsilon,
+                minimum_edge_length,
+                minimum_area,
+                maximum_vertex_shift,
+            )
+            if candidate_reason is not None:
+                break
+            collinear_indices = next_indices
+            indices = next_indices
+            vertices = candidate_vertices
+
+    # The same false corner can be the fourth point of a physical triangle.
+    # The contour-index cleanup above deliberately targeted 5->4 candidates;
+    # finish every successful fit in vertex space so a 170+ degree 4->3 split
+    # cannot leak through either the primary or short-edge fallback path.
+    if reason is None:
+        vertices = _merge_collinear_fitted_vertices(
+            vertices,
+            minimum_edge_length,
+            minimum_area,
+        )
+
+    # A high epsilon can bridge across a shallow but valid corner and make a
+    # quadrilateral/pentagon look like a triangle. Retry that ambiguous case
+    # at progressively lower epsilons. The former implementation stopped when
+    # the first recovery scale still had three points, precisely when a still
+    # lower epsilon was needed to reveal the fourth corner.
+    if len(indices) <= 3 and base_epsilon > 1.5:
+        recovery_epsilon = max(1.5, base_epsilon * 0.60)
+        for _ in range(5):
+            recovery_cleaned, recovery_indices = (
+                simplify_closed_contour_indices(
+                    cleaned, recovery_epsilon
+                )
+            )
+            recovery_indices = _prune_short_corner_pairs(
+                recovery_cleaned,
+                recovery_indices,
+                minimum_edge_length,
+            )
+            if 4 <= len(recovery_indices) <= 5:
+                recovered_vertices, recovered_reason = (
+                    _refine_and_validate(
+                        recovery_cleaned,
+                        recovery_indices,
+                        recovery_epsilon,
+                        minimum_edge_length,
+                        minimum_area,
+                        maximum_vertex_shift,
+                    )
+                )
+                if recovered_reason is None:
+                    # Recovery may expose both the missing shallow corner and
+                    # one nearly-collinear staircase point on a long side.
+                    # Apply the same conservative final cleanup used by the
+                    # primary path before accepting the lower-epsilon result,
+                    # including the 4->3 case for a split triangle side.
+                    # Keep the already fitted vertices here: fitting the two
+                    # joined contour spans again can pull a genuine short edge
+                    # just below its validation tolerance.
+                    recovered_vertices = (
+                        _merge_collinear_fitted_vertices(
+                            recovered_vertices,
+                            minimum_edge_length,
+                            minimum_area,
+                        )
+                    )
+                    return recovered_vertices, None
+            if recovery_epsilon <= 1.5:
+                break
+            recovery_epsilon = max(1.5, recovery_epsilon * 0.75)
+
+    return vertices, reason
 
 
-def measure_polygon(vertices, pixels_per_cm=None):
+def contour_length(contour):
+    """Return the length of a closed traced pixel chain."""
+    if len(contour) < 2:
+        return 0.0
+    total = 0.0
+    for index in range(len(contour)):
+        total += distance(contour[index], contour[(index + 1) % len(contour)])
+    return total
+
+
+def measure_polygon(
+    vertices,
+    traced_boundary_length_px=None,
+    edge_support=None,
+):
     edge_lengths_px = []
     for index in range(len(vertices)):
         edge_lengths_px.append(
@@ -405,30 +819,23 @@ def measure_polygon(vertices, pixels_per_cm=None):
     edge_lengths_px_rounded = [round(value, 2) for value in edge_lengths_px]
     perimeter_px = round(sum(edge_lengths_px), 2)
 
-    if pixels_per_cm is None or pixels_per_cm <= 0:
-        vertices_cm = None
-        edge_lengths_cm = None
-        perimeter_cm = None
-    else:
-        vertices_cm = [
-            [
-                round(point[0] / pixels_per_cm, 3),
-                round(point[1] / pixels_per_cm, 3),
-            ]
-            for point in vertices
-        ]
-        edge_lengths_cm = [
-            round(value / pixels_per_cm, 3) for value in edge_lengths_px
-        ]
-        perimeter_cm = round(sum(edge_lengths_px) / pixels_per_cm, 3)
-
     center = centroid(vertices)
+    traced_boundary_length_px = (
+        None
+        if traced_boundary_length_px is None
+        else round(traced_boundary_length_px, 2)
+    )
+
     return {
+        "vertex_count": len(vertices),
         "vertices_px": vertices_px,
-        "vertices_cm": vertices_cm,
         "edge_lengths_px": edge_lengths_px_rounded,
-        "edge_lengths_cm": edge_lengths_cm,
+        "boundary_length_px": perimeter_px,
         "perimeter_px": perimeter_px,
-        "perimeter_cm": perimeter_cm,
+        "traced_boundary_length_px": traced_boundary_length_px,
+        "edge_support": (
+            None if edge_support is None else round(edge_support, 3)
+        ),
+        "area_px2": round(abs(signed_area(vertices)), 2),
         "centroid_px": [int(round(center[0])), int(round(center[1]))],
     }
