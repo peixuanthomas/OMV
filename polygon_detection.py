@@ -38,10 +38,11 @@ FOREGROUND_POLARITY = "bright"
 # 200+ gray levels while the work surface is roughly 150-160. Keeping a
 # 20-level margin preserves the dimmer pointed end of the white piece.
 FIXED_FOREGROUND_THRESHOLD = 180
-MINIMUM_EDGE_PX = 32.0
-# Perspective, threshold stair-steps and line intersections can shorten a
-# physical 32 px edge by a few pixels. Keep the physical target explicit while
-# validating against a small measurement tolerance.
+MINIMUM_EDGE_PX = 20.0
+# The shortest supported piece edge is about 20 px in the fixed fixture.
+# Perspective, threshold stair-steps and line intersections can measure it at
+# 16-19 px, so keep the physical target explicit while validating against a
+# small measurement tolerance.
 EDGE_LENGTH_TOLERANCE_PX = 4.0
 MINIMUM_VALIDATED_EDGE_PX = (
     MINIMUM_EDGE_PX - EDGE_LENGTH_TOLERANCE_PX
@@ -81,6 +82,7 @@ MINIMUM_EDGE_SUPPORT = 0.30
 STABLE_FRAMES = 2
 STABLE_VERTEX_TOLERANCE_PX = 6.0
 REEMIT_MOVEMENT_PX = 10.0
+REEMIT_INTERVAL_MS = 1000
 TEMPORAL_SMOOTHING_ALPHA = 0.45
 DETECT_EVERY_N_FRAMES = 2
 GC_EVERY_FRAMES = 20
@@ -798,7 +800,6 @@ def _serializable_polygon(polygon):
         "id": polygon["id"],
         "side_count": polygon["vertex_count"],
         "vertices_px": polygon["vertices_px"],
-        "edge_lengths_px": polygon["edge_lengths_px"],
     }
 
 
@@ -806,15 +807,6 @@ def make_serial_payload(result):
     return {
         "status": result["status"],
         "count": result["count"],
-        "threshold": result["threshold"],
-        "foreground_polarity": result["polarity"],
-        "foreground_mode": FOREGROUND_POLARITY,
-        "edge_validation": (
-            "canny" if ENABLE_CANNY_VALIDATION else "disabled"
-        ),
-        "canny_threshold": (
-            list(EDGE_THRESHOLD) if ENABLE_CANNY_VALIDATION else None
-        ),
         "coordinate_system": {
             "origin_px": [0, 0],
             "x_direction": "right",
@@ -826,8 +818,18 @@ def make_serial_payload(result):
             _serializable_polygon(polygon)
             for polygon in result["polygons"]
         ],
-        "rejected": result["rejected"],
     }
+
+
+def is_simulator_payload(payload):
+    """Return True only for records accepted by the desktop simulator."""
+    polygons = payload.get("polygons")
+    return (
+        payload.get("status") == "ok"
+        and isinstance(polygons, list)
+        and 1 <= len(polygons) <= MAX_POLYGONS
+        and payload.get("count") == len(polygons)
+    )
 
 
 def _smooth_result(previous, current):
@@ -876,12 +878,28 @@ def _smooth_result(previous, current):
     return smoothed
 
 
+def _ticks_ms():
+    ticks_ms = getattr(time, "ticks_ms", None)
+    if ticks_ms is not None:
+        return ticks_ms()
+    return int(time.time() * 1000)
+
+
+def _ticks_diff(new_ticks, old_ticks):
+    ticks_diff = getattr(time, "ticks_diff", None)
+    if ticks_diff is not None:
+        return ticks_diff(new_ticks, old_ticks)
+    return new_ticks - old_ticks
+
+
 class StableResultReporter:
-    def __init__(self):
+    def __init__(self, uart):
+        self.uart = uart
         self.pending_result = None
         self.pending_frames = 0
         self.stable_result = None
         self.last_emitted_result = None
+        self.last_emitted_ms = None
 
     def update(self, result):
         if _results_close(
@@ -902,15 +920,29 @@ class StableResultReporter:
 
         self.stable_result = self.pending_result
 
-        if _results_close(
+        now_ms = _ticks_ms()
+        result_unchanged = _results_close(
             self.stable_result,
             self.last_emitted_result,
             REEMIT_MOVEMENT_PX,
+        )
+        if (
+            result_unchanged
+            and self.last_emitted_ms is not None
+            and _ticks_diff(now_ms, self.last_emitted_ms)
+            < REEMIT_INTERVAL_MS
         ):
             return self.stable_result
 
-        print(json.dumps(make_serial_payload(self.stable_result)))
+        payload = make_serial_payload(self.stable_result)
+        if not is_simulator_payload(payload):
+            return self.stable_result
+
+        message = json.dumps(payload)
+        self.uart.write(message)
+        self.uart.write("\r\n")
         self.last_emitted_result = self.stable_result
+        self.last_emitted_ms = now_ms
         return self.stable_result
 
 
@@ -932,6 +964,13 @@ def _processing_error_result(error):
 
 
 def main():
+    # OpenMV H7 Plus UART3: TX=P4, RX=P5. Only TX is required by the bridge.
+    from machine import UART
+
+    uart = UART(3, baudrate=115200, bits=8, parity=None, stop=1)
+    # Clear any partial/noise record accumulated while P4 was undriven.
+    uart.write("\r\n")
+
     # Reuse the camera and buffering setup already proven by 04.edges.py.
     camera = init_camera()
     locked_gain_db = None
@@ -949,7 +988,7 @@ def main():
             print("CAMERA_LOCK_WARNING: %s" % str(error))
 
     clock = time.clock()
-    reporter = StableResultReporter()
+    reporter = StableResultReporter(uart)
     frame_number = 0
 
     print("POLYGON_DETECTOR_READY")

@@ -64,6 +64,34 @@ class PolygonGeometryTests(unittest.TestCase):
         ]
         self.assertGreaterEqual(min(edge_lengths), 32.0)
 
+    def test_keeps_shortest_live_quadrilateral_side(self):
+        # Fixed-camera regression extracted from the center piece: perspective
+        # measures its shortest physical 20 px edge at about 19.25 px. The old
+        # validation merged that edge and reported this quadrilateral as a
+        # triangle. The detector now validates at 16 px to preserve it.
+        contour = _raster_contour(
+            [(210, 203), (353, 209), (356, 228), (286, 250)]
+        )
+
+        vertices, reason = geometry.polygon_from_contour(
+            contour,
+            rdp_epsilon=6.0,
+            minimum_edge_length=16.0,
+            minimum_area=600.0,
+        )
+
+        self.assertIsNone(reason)
+        self.assertEqual(4, len(vertices))
+        edge_lengths = [
+            geometry.distance(
+                vertices[index],
+                vertices[(index + 1) % len(vertices)],
+            )
+            for index in range(len(vertices))
+        ]
+        self.assertGreaterEqual(min(edge_lengths), 16.0)
+        self.assertLess(min(edge_lengths), 20.0)
+
     def test_short_rough_edge_is_refined_before_validation(self):
         contour = _raster_contour(
             [(306, 263), (134, 216), (291, 188), (301, 219)]
