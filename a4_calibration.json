@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "mode": "lens_only_dynamic_a4",
+  "camera": {
+    "sensor_id": null,
+    "width": 640,
+    "height": 480,
+    "hmirror": false,
+    "vflip": false,
+    "transpose": false,
+    "calibration_pixformat": "RGB565",
+    "runtime_pixformat": "GRAYSCALE",
+    "camera_height_mm_nominal": 295
+  },
+  "a4": {
+    "x_mm": 210.0,
+    "y_mm": 297.0,
+    "orientation": "long_edge_right_short_edge_down",
+    "origin": "red_a4_top_left",
+    "pose_saved": false
+  },
+  "lens": {
+    "strength": 1.6,
+    "zoom": 1.0,
+    "x_corr": 0.0,
+    "y_corr": 0.0
+  },
+  "quality": {
+    "paper_pose_saved": false,
+    "source": "live_red_a4_visual_fit",
+    "criterion": "lens_only_live_a4_pose"
+  },
+  "capture_settings": {},
+  "runtime": {
+    "paper_localization": "per_frame_grayscale",
+    "dark_threshold": 165
+  }
+}

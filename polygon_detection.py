@@ -18,10 +18,13 @@ except ImportError:
     import ujson as json
 
 import polygon_geometry as geometry
+import calibration_geometry as calibration
 from openmv_edge_detection import (
     EDGE_THRESHOLD,
     init_camera,
+    load_runtime_calibration,
     process_image as detect_edges_in_place,
+    rectify_image,
 )
 
 
@@ -760,6 +763,67 @@ def draw_result(frame, result):
         _draw_polygon(frame, polygon)
 
 
+def draw_calibrated_axes(frame, calibration_config, calibration_error=None):
+    """Draw the requested O/X/Y physical coordinate frame in the IDE."""
+    if calibration_config is None:
+        _draw_shadowed_text(
+            frame,
+            4,
+            frame.height() - 24,
+            "CAL REQUIRED: %s" % str(calibration_error),
+            TEXT_COLOR,
+        )
+        return
+
+    origin_x = 10
+    origin_y = 10
+    x_end_y = 100
+    y_end_x = 130
+    frame.draw_line(
+        (origin_x, origin_y, origin_x, x_end_y),
+        color=OUTLINE_SHADOW_COLOR,
+        thickness=8,
+    )
+    frame.draw_line(
+        (origin_x, origin_y, origin_x, x_end_y),
+        color=TEXT_COLOR,
+        thickness=4,
+    )
+    frame.draw_line(
+        (origin_x, x_end_y, origin_x - 6, x_end_y - 12),
+        color=TEXT_COLOR,
+        thickness=4,
+    )
+    frame.draw_line(
+        (origin_x, x_end_y, origin_x + 6, x_end_y - 12),
+        color=TEXT_COLOR,
+        thickness=4,
+    )
+    frame.draw_line(
+        (origin_x, origin_y, y_end_x, origin_y),
+        color=OUTLINE_SHADOW_COLOR,
+        thickness=8,
+    )
+    frame.draw_line(
+        (origin_x, origin_y, y_end_x, origin_y),
+        color=TEXT_COLOR,
+        thickness=4,
+    )
+    frame.draw_line(
+        (y_end_x, origin_y, y_end_x - 12, origin_y - 6),
+        color=TEXT_COLOR,
+        thickness=4,
+    )
+    frame.draw_line(
+        (y_end_x, origin_y, y_end_x - 12, origin_y + 6),
+        color=TEXT_COLOR,
+        thickness=4,
+    )
+    _draw_shadowed_text(frame, 18, 18, "O", TEXT_COLOR)
+    _draw_shadowed_text(frame, 18, 80, "X 210MM", TEXT_COLOR)
+    _draw_shadowed_text(frame, 72, 18, "Y 297MM", TEXT_COLOR)
+
+
 def _results_close(first, second, tolerance):
     if first is None or second is None:
         return False
@@ -795,30 +859,65 @@ def _results_close(first, second, tolerance):
     return True
 
 
-def _serializable_polygon(polygon):
-    return {
+def _serializable_polygon(polygon, calibration_config=None):
+    serialized = {
         "id": polygon["id"],
         "side_count": polygon["vertex_count"],
         "vertices_px": polygon["vertices_px"],
     }
+    if calibration_config is not None:
+        camera = calibration_config["camera"]
+        serialized.update(
+            calibration.metric_polygon_measurements(
+                polygon["vertices_px"],
+                camera["width"],
+                camera["height"],
+            )
+        )
+    return serialized
 
 
-def make_serial_payload(result):
-    return {
+def make_serial_payload(
+    result,
+    calibration_config=None,
+    calibration_error=None,
+):
+    payload = {
         "status": result["status"],
         "count": result["count"],
         "coordinate_system": {
             "origin_px": [0, 0],
             "x_direction": "right",
             "y_direction": "down",
+            "frame": (
+                "rectified_a4_plane"
+                if calibration_config is not None
+                else "raw_camera"
+            ),
             "vertex_order": "clockwise",
             "first_vertex": "topmost_then_leftmost",
         },
         "polygons": [
-            _serializable_polygon(polygon)
+            _serializable_polygon(polygon, calibration_config)
             for polygon in result["polygons"]
         ],
     }
+    if calibration_config is not None:
+        payload["calibration"] = {
+            "status": "ok",
+            "version": calibration_config["version"],
+            "mode": "lens_only_dynamic_a4",
+            "paper_pose": "detected_this_frame",
+        }
+        payload["physical_coordinate_system"] = (
+            calibration.physical_coordinate_system(calibration_config)
+        )
+    else:
+        payload["calibration"] = {
+            "status": "calibration_required",
+            "reason": str(calibration_error),
+        }
+    return payload
 
 
 def is_simulator_payload(payload):
@@ -893,8 +992,15 @@ def _ticks_diff(new_ticks, old_ticks):
 
 
 class StableResultReporter:
-    def __init__(self, uart):
+    def __init__(
+        self,
+        uart,
+        calibration_config=None,
+        calibration_error=None,
+    ):
         self.uart = uart
+        self.calibration_config = calibration_config
+        self.calibration_error = calibration_error
         self.pending_result = None
         self.pending_frames = 0
         self.stable_result = None
@@ -934,7 +1040,11 @@ class StableResultReporter:
         ):
             return self.stable_result
 
-        payload = make_serial_payload(self.stable_result)
+        payload = make_serial_payload(
+            self.stable_result,
+            calibration_config=self.calibration_config,
+            calibration_error=self.calibration_error,
+        )
         if not is_simulator_payload(payload):
             return self.stable_result
 
@@ -973,6 +1083,7 @@ def main():
 
     # Reuse the camera and buffering setup already proven by 04.edges.py.
     camera = init_camera()
+    calibration_config, calibration_error = load_runtime_calibration(camera)
     locked_gain_db = None
     locked_exposure_us = None
     if LOCK_CAMERA_SETTINGS:
@@ -988,7 +1099,11 @@ def main():
             print("CAMERA_LOCK_WARNING: %s" % str(error))
 
     clock = time.clock()
-    reporter = StableResultReporter(uart)
+    reporter = StableResultReporter(
+        uart,
+        calibration_config=calibration_config,
+        calibration_error=calibration_error,
+    )
     frame_number = 0
 
     print("POLYGON_DETECTOR_READY")
@@ -1004,6 +1119,13 @@ def main():
         "MIN_EDGE_TARGET=%.1fPX VALIDATE_AT=%.1fPX"
         % (MINIMUM_EDGE_PX, MINIMUM_VALIDATED_EDGE_PX)
     )
+    if calibration_config is None:
+        print("CALIBRATION_REQUIRED: %s" % calibration_error)
+    else:
+        print(
+            "LENS_CALIBRATION_OK A4_POSE=DETECTED_EACH_FRAME "
+            "X=DOWN_210MM Y=RIGHT_297MM"
+        )
     if locked_gain_db is not None and locked_exposure_us is not None:
         print(
             "CAMERA_LOCKED gain=%.2fdB exposure=%dus"
@@ -1014,6 +1136,26 @@ def main():
         while True:
             clock.tick()
             frame = camera.snapshot()
+            if calibration_config is not None:
+                try:
+                    rectify_image(frame, calibration_config)
+                except Exception as error:
+                    result = _processing_error_result(
+                        RuntimeError(
+                            "rectification: %s" % str(error)
+                        )
+                    )
+                    display_result = reporter.update(result)
+                    if display_result is not None:
+                        draw_result(frame, display_result)
+                    draw_calibrated_axes(
+                        frame,
+                        None,
+                        "a4_pose:%s" % str(error),
+                    )
+                    camera.flush()
+                    frame_number += 1
+                    continue
             should_detect = (
                 reporter.stable_result is None
                 or frame_number % DETECT_EVERY_N_FRAMES == 0
@@ -1031,6 +1173,9 @@ def main():
 
             if display_result is not None:
                 draw_result(frame, display_result)
+            draw_calibrated_axes(
+                frame, calibration_config, calibration_error
+            )
             # Double buffering can otherwise let the IDE request the next raw
             # buffer before the overlay is transferred. Flush the completed
             # annotated grayscale frame explicitly.

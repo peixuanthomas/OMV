@@ -11,7 +11,9 @@ import unittest
 openmv_edges = types.ModuleType("openmv_edge_detection")
 openmv_edges.EDGE_THRESHOLD = (50, 80)
 openmv_edges.init_camera = None
+openmv_edges.load_runtime_calibration = None
 openmv_edges.process_image = None
+openmv_edges.rectify_image = None
 sys.modules.setdefault("openmv_edge_detection", openmv_edges)
 
 import polygon_detection as detection

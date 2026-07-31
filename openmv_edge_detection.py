@@ -10,6 +10,9 @@ import csi
 import image
 import time
 
+import calibration_geometry as calibration
+import a4_runtime
+
 
 # Match the VGA resolution used by the original 04.Detecting example. The H7
 # Plus has enough external memory for grayscale VGA with double buffering.
@@ -32,6 +35,11 @@ def init_camera():
     camera.reset()
     camera.pixformat(csi.GRAYSCALE)
     camera.framesize(FRAME_SIZE)
+    # Calibration is tied to this exact physical orientation. Make it
+    # explicit instead of relying on sensor reset defaults.
+    camera.hmirror(False)
+    camera.vflip(False)
+    camera.transpose(False)
 
     # Double buffering allows the sensor to capture the next frame while the
     # current frame is being processed. This call must follow framesize(),
@@ -43,6 +51,17 @@ def init_camera():
     return camera
 
 
+def load_runtime_calibration(camera, path=calibration.CONFIG_PATH):
+    """Load calibration only when it matches this live camera geometry."""
+    signature = calibration.camera_signature(camera)
+    return calibration.load_calibration(path, signature=signature)
+
+
+def rectify_image(frame, calibration_config):
+    """Apply saved lens correction and the current frame's live A4 pose."""
+    return a4_runtime.rectify_to_a4(frame, calibration_config)
+
+
 def process_image(frame):
     """Replace a grayscale camera frame with its detected edges."""
     frame.find_edges(EDGE_ALGORITHM, threshold=EDGE_THRESHOLD)
@@ -51,6 +70,7 @@ def process_image(frame):
 
 def main():
     camera = init_camera()
+    calibration_config, calibration_error = load_runtime_calibration(camera)
     clock = time.clock()
     frame_count = 0
 
@@ -58,11 +78,22 @@ def main():
         "Edge detection ready: %dx%d, Canny thresholds=%s"
         % (camera.width(), camera.height(), str(EDGE_THRESHOLD))
     )
+    if calibration_config is None:
+        print("CALIBRATION_REQUIRED: %s" % calibration_error)
+    else:
+        print("LENS_CALIBRATION_OK A4_POSE=DETECTED_EACH_FRAME")
 
     try:
         while True:
             clock.tick()
             frame = camera.snapshot()
+            if calibration_config is not None:
+                try:
+                    rectify_image(frame, calibration_config)
+                except Exception as error:
+                    print("A4_POSE_REQUIRED: %s" % str(error))
+                    camera.flush()
+                    continue
             process_image(frame)
 
             frame_count += 1
